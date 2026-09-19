@@ -35,6 +35,14 @@ For tab completion of flags and live session names, add this to `~/.bashrc`:
 source ~/src/yoloagy/completion/yoloagy.bash
 ```
 
+On Windows, add this to your PowerShell profile (`notepad $PROFILE`) for the
+same completion in PowerShell. It runs the bash completer under Git Bash, so
+the two always agree:
+
+```powershell
+. C:\src\yoloagy\completion\yoloagy.ps1
+```
+
 ## Usage
 
 ```
@@ -124,8 +132,10 @@ psmux with `winget install marlocarlo.psmux`.
   loads your PowerShell profile. A `Set-Location` in that profile overrides the
   directory yoloagy starts the session in.
 - Worktree isolation is off on Windows.
+- Tab completion in PowerShell comes from `completion/yoloagy.ps1` (see
+  [Install](#install)).
 
-## Gating agy's commands
+## Gating agy's commands and file writes
 
 yoloagy starts agy without `--dangerously-skip-permissions`. That flag approves
 every prompt, including a prompt that a command gate raised because it wanted
@@ -140,7 +150,8 @@ set it up like this:
 
 1. Install the hook at user scope in `~/.gemini/config/hooks.json`, so every
    agy session on the machine is gated. The exact block is in the
-   construct-auto-classifier README.
+   construct-auto-classifier README; its matcher covers `run_command` and
+   agy's file-writing tools.
 2. Set `"toolPermission": "request-review"` in
    `~/.gemini/antigravity-cli/settings.json`. agy then asks before every
    command.
@@ -148,16 +159,19 @@ set it up like this:
    allows a command, it answers agy's prompt for that command in agy's tmux
    pane.
 
-Inside a yoloagy session, allowed commands then run without a prompt, and the
-only command prompts you see are the gate's escalations, which show its reason.
-If the gate is not installed, crashes, or times out, nothing answers the prompt
-and you decide every command yourself.
+Inside a yoloagy session, allowed commands then run without a prompt, and so
+do file writes inside the project. The only prompts you see are the gate's
+escalations, which show its reason: a command it judged risky twice, or a write
+outside the project or into places like `.git/`, harness config or CI
+workflows. If the gate is not installed, crashes, or times out, nothing answers
+the prompt and you decide every command yourself.
 
 The gate finds the pane from the `TMUX` and `TMUX_PANE` variables that tmux
 sets inside it, so it reaches yoloagy's per-session server without extra
-configuration. Under psmux on Windows this depends on psmux setting those
-variables and on `tmux` being runnable from the hook; check it on your machine
-before relying on it.
+configuration. This works the same under psmux on Windows (checked with psmux
+3.3.7 and agy 1.2.7): psmux sets both variables in the pane, and also a
+`PSMUX_TARGET_SESSION` that routes the gate's `tmux` calls to the right
+session.
 
 ## Tests
 
