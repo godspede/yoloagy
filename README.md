@@ -85,8 +85,9 @@ So when you start a named session (`yoloagy <alias>`) from a repository's main
 checkout, yoloagy creates a linked worktree for it:
 
 - path `<repo>/.worktrees/<session>`, on branch `yolo/<session>`;
-- based on the remote's default branch after a best-effort fetch, falling back
-  to a local `main` or `master`, then to the current branch;
+- based on `YOLOAGY_BASE_BRANCH` if you set it, otherwise the remote's default
+  branch, after a best-effort fetch, falling back to a local `main` or
+  `master`, then to the current branch;
 - reused on later launches of the same session.
 
 It launches in place instead when:

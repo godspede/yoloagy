@@ -222,16 +222,17 @@ _yolo_resolve_launch_dir() {
     local wt="$top/.worktrees/$session"
     if [ -d "$wt" ]; then printf '%s' "$wt"; return 0; fi
 
-    # Branch off the freshest copy of the default branch: the shared checkout is
-    # often behind, and a stale base starts the session behind too. A failed
-    # fetch (offline, no remote) falls through to local refs.
+    # Branch off the freshest copy of YOLOAGY_BASE_BRANCH, else the default
+    # branch: the shared checkout is often behind, and a stale base starts the
+    # session behind too. A failed fetch (offline, no remote) falls through to
+    # local refs.
     local branch="yolo/$session" base="" remote def out b
     remote=$(git -C "$top" config branch.main.remote 2>/dev/null) \
         || remote=$(git -C "$top" config branch.master.remote 2>/dev/null) \
         || remote=origin
     def=$(git -C "$top" symbolic-ref --quiet --short "refs/remotes/$remote/HEAD" 2>/dev/null) || def=
     def="${def#"$remote"/}"
-    for b in $def main master; do
+    for b in ${YOLOAGY_BASE_BRANCH:-} $def main master; do
         if git -C "$top" fetch --quiet "$remote" "$b" 2>/dev/null \
             && git -C "$top" show-ref --verify --quiet "refs/remotes/$remote/$b"; then
             base="$remote/$b"; break
@@ -290,6 +291,8 @@ non-git directories launch in place. Linux and macOS only.
 
 Environment:
   YOLOAGY_AGY                   agy command to run (default: `agy` on PATH, else ~/.local/bin/agy)
+  YOLOAGY_BASE_BRANCH           branch new worktrees start from (default: the
+                                remote's default branch, then main, then master)
   YOLOAGY_WORKTREE              0 to launch every session in place, as if
                                 --here were always given (default: 1)
 

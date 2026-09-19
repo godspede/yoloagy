@@ -164,6 +164,16 @@ case "$out" in *"dir=$repo/.worktrees/proj-envforce"*) ;; *) fail "--worktree ov
 [ -d "$repo/.worktrees/proj-envforce" ] || fail "--worktree made no worktree"
 ok "--worktree overrides YOLOAGY_WORKTREE=0"
 
+# YOLOAGY_BASE_BRANCH picks the branch a new worktree starts from.
+dev=$(git -C "$repo" -c user.name=smoke -c user.email=smoke@example.invalid \
+    commit-tree -p main -m "only on development" "main^{tree}")
+git -C "$repo" update-ref refs/heads/development "$dev"
+started+=("proj-onbase")
+out=$(YOLOAGY_BASE_BRANCH=development "$yoloagy" --detach onbase 2>/dev/null)
+[ "$(git -C "$repo/.worktrees/proj-onbase" rev-parse HEAD)" = "$(git -C "$repo" rev-parse development)" ] \
+    || fail "YOLOAGY_BASE_BRANCH not used: $out"
+ok "YOLOAGY_BASE_BRANCH sets the worktree's base"
+
 # The bare session launches in place, as "agy".
 started+=("agy")
 out=$("$yoloagy" --detach 2>/dev/null)
