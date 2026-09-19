@@ -1,0 +1,440 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# yoloagy — start (or reattach to) a tmux session running agy (the Google
+# Antigravity CLI), so an SSH dropout leaves the conversation running. SSH back
+# in and re-run the same command to pick it up.
+#
+# Each session runs on its own tmux server (`-L <session>`), and a named session
+# started from a git repository's primary checkout gets its own linked worktree.
+# Run `yoloagy --help` for usage.
+set -eu
+
+# One `uname -s` per process; every platform check below reads this.
+: "${_YOLO_OS:=$(uname -s)}"
+
+_yolo_is_windows() {
+    case "$_YOLO_OS" in MINGW*|MSYS*|CYGWIN*) return 0 ;; *) return 1 ;; esac
+}
+
+# ---------------------------------------------------------------------------
+# Multiplexer binding
+# ---------------------------------------------------------------------------
+
+# _yolo_bind_mux — on Windows, point a `tmux` function at psmux's real binary
+# and publish its path as _YOLO_MUX_BIN.
+#
+# The WinGet `tmux` shim is a symlink into psmux's package directory that Git
+# Bash may refuse to exec ("Permission denied"), so the real tmux.exe under
+# WinGet\Packages is preferred. The function covers ordinary calls; `exec` and
+# tmux's own `detach-client -E` command string bypass shell functions, so those
+# sites use _YOLO_MUX_BIN directly.
+_yolo_bind_mux() {
+    _yolo_is_windows || return 0
+    # psmux rewrites Ctrl+J (LF) into Enter (CR) whenever SSH_CONNECTION is set,
+    # which turns the harness's newline key into submit. psmux decides this from
+    # the environment alone, so unsetting it is the only lever (psmux >= 3.3.7).
+    # Panes also stop inheriting it, so an SSH-only pwsh profile block does not
+    # re-run inside the pane.
+    unset SSH_CONNECTION SSH_CLIENT SSH_TTY
+    local cand
+    for cand in "$HOME"/AppData/Local/Microsoft/WinGet/Packages/*psmux*/tmux.exe; do
+        [ -f "$cand" ] || continue
+        _YOLO_MUX_BIN=$cand
+        break
+    done
+    if [ -z "${_YOLO_MUX_BIN:-}" ] && command -v tmux.exe >/dev/null 2>&1; then
+        _YOLO_MUX_BIN=$(command -v tmux.exe)
+    fi
+    if [ -n "${_YOLO_MUX_BIN:-}" ]; then
+        tmux() { command "$_YOLO_MUX_BIN" "$@"; }
+    fi
+}
+
+# _yolo_require_mux — fail up front, naming the cause, when no multiplexer
+# exists. Otherwise the first tmux call dies deep in session creation and the
+# error blames the session instead of the missing binary.
+_yolo_require_mux() {
+    if [ -n "${_YOLO_MUX_BIN:-}" ] || type -t tmux >/dev/null 2>&1; then
+        return 0
+    fi
+    if _yolo_is_windows; then
+        cat >&2 <<'EOF'
+yoloagy: no terminal multiplexer found; psmux's tmux.exe is missing.
+
+Install psmux:  winget install marlocarlo.psmux
+
+If psmux is installed, Windows Defender may have quarantined its tmux.exe as
+Behavior:Win32/Execution.A!ml (a false positive). That also breaks the WinGet
+`tmux` shim, which links into the same package directory. Check with
+`MpCmdRun.exe -Restore -ListAll`, then restore it and add an exclusion for the
+package directory under %LOCALAPPDATA%\Microsoft\WinGet\Packages.
+EOF
+    else
+        echo "yoloagy: no terminal multiplexer found; tmux is not on PATH." >&2
+    fi
+    return 1
+}
+
+# _yolo_tune_mux <session> — server options every session needs.
+#
+# escape-time: tmux's default 500ms holds an Esc back to see whether another key
+# follows, so Esc reaches the harness half a second late and two quick presses
+# arrive together as `\x1b\x1b`, which a TUI key parser reads as Alt+Esc rather
+# than two Escapes. 10ms still recognises a real Alt+key, which the terminal
+# sends as one write. Set on every launch so a reattach fixes an older server.
+# Skipped under psmux, where the option's effect is unverified.
+_yolo_tune_mux() {
+    _yolo_is_windows && return 0
+    tmux -L "$1" set-option -s escape-time 10 >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------------------
+# Session naming and listing
+# ---------------------------------------------------------------------------
+
+# Directory names that don't identify a project on their own; the prefix walks
+# up past them.
+_yolo_prefix_transparent() {
+    case "$1" in
+        repo|repos|src|source|code|app|project|main|trunk|scripts|bin|tools)
+            return 0 ;;
+    esac
+    return 1
+}
+
+# _yolo_session_prefix — derive the session-name prefix from $PWD: the
+# basename, walking up past transparent names (so ~/src/webapp/scripts gives
+# `webapp`) and past `<repo>/.worktrees/<session>` to the repo that session was
+# named under. $HOME gives `home`, / gives `root`. tmux rewrites `.` and `:` in
+# session names, so they are replaced here to keep the name addressable.
+_yolo_session_prefix() {
+    local d="$PWD" base parent
+    if [ "$d" = "$HOME" ]; then printf home; return; fi
+    if [ "$d" = "/" ]; then printf root; return; fi
+    while :; do
+        base="${d##*/}"
+        parent="${d%/*}"
+        if [ "${parent##*/}" = ".worktrees" ]; then
+            d="${parent%/*}"
+            [ -n "$d" ] || break
+            continue
+        fi
+        if _yolo_prefix_transparent "$base"; then
+            if [ -z "$parent" ] || [ "$parent" = "$d" ]; then
+                break
+            fi
+            d="$parent"
+            continue
+        fi
+        break
+    done
+    base="${base// /-}"
+    base="${base//./_}"
+    base="${base//:/}"
+    [ -n "$base" ] || base="yolo"
+    printf '%s' "$base"
+}
+
+# _yolo_list_sessions — print every live yoloagy session, one per line.
+#
+# Each session lives on its own server, so a bare `tmux ls` (the default
+# socket) sees none of them. A yoloagy server is one whose socket name equals
+# its session name; other tmux servers are left out.
+_yolo_list_sessions() {
+    if _yolo_is_windows; then
+        # psmux keeps `<socket>__<session>.port` per live server in ~/.psmux,
+        # plus an automatic `__warm__` pool session per socket.
+        local pf b sess sock
+        for pf in "$HOME/.psmux"/*__*.port; do
+            [ -e "$pf" ] || continue
+            b="${pf##*/}"; b="${b%.port}"
+            sock="${b%%__*}"
+            sess="${b#*__}"
+            if [ "$sess" = "$sock" ]; then printf '%s\n' "$sock"; fi
+        done | sort -u
+        return 0
+    fi
+    local td sock name
+    td="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)"
+    for sock in "$td"/*; do
+        [ -S "$sock" ] || continue
+        name="${sock##*/}"
+        tmux -L "$name" ls -F '#{session_name}' 2>/dev/null \
+            | while IFS= read -r s; do
+                if [ "$s" = "$name" ]; then printf '%s\n' "$s"; fi
+            done
+    done | sort -u
+    return 0
+}
+
+# _yolo_session_absent <session> — 0 only when the session provably has no
+# server. Asking psmux about a socket with no server behind it waits out a
+# connect (about 1.5s), while a live psmux server always has its `.port` file,
+# so the file's absence answers for free. Elsewhere this cannot prove anything
+# and returns 1; a dead tmux socket answers quickly anyway.
+_yolo_session_absent() {
+    _yolo_is_windows || return 1
+    [ -e "$HOME/.psmux/${1}__${1}.port" ] && return 1
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Worktree isolation
+# ---------------------------------------------------------------------------
+
+# _yolo_resolve_launch_dir <session> <want:0|1> — print the directory the
+# session should start in.
+#
+# Parallel sessions in one checkout share its working tree, index and HEAD: a
+# `git add -A` in one sweeps another's uncommitted edits into its commit, and a
+# branch switch in one moves the other. A linked worktree gives each session its
+# own tree, index and HEAD over a shared object store.
+#
+# Redirects into <repo>/.worktrees/<session> (branch yolo/<session>) only when
+# the cwd is a repository's primary checkout. A cwd already inside a linked
+# worktree launches in place, so `cd .worktrees/foo && yoloagy bar` resumes
+# there instead of nesting. Non-git directories, want=0 (--here) and Windows
+# launch in place. Best-effort: any failure prints $PWD, so a session always
+# starts. Diagnostics go to stderr; stdout is only the directory.
+_yolo_resolve_launch_dir() {
+    local session="$1" want="$2"
+    if [ "$want" != "1" ] || _yolo_is_windows; then
+        printf '%s' "$PWD"; return 0
+    fi
+
+    local top
+    top=$(git rev-parse --show-toplevel 2>/dev/null) \
+        || { printf '%s' "$PWD"; return 0; }
+
+    # In the primary checkout --git-dir and --git-common-dir are the same
+    # directory; in a linked worktree they differ.
+    local gitdir common
+    gitdir=$(git rev-parse --absolute-git-dir 2>/dev/null)
+    common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common=
+    if [ -z "$common" ]; then
+        common=$(git rev-parse --git-common-dir 2>/dev/null)
+        case "$common" in /*) ;; *) common="$top/$common" ;; esac
+    fi
+    if [ "$(cd "$gitdir" && pwd -P)" != "$(cd "$common" && pwd -P)" ]; then
+        printf '%s' "$PWD"; return 0
+    fi
+
+    local wt="$top/.worktrees/$session"
+    if [ -d "$wt" ]; then printf '%s' "$wt"; return 0; fi
+
+    # Branch off the freshest copy of the default branch: the shared checkout is
+    # often behind, and a stale base starts the session behind too. A failed
+    # fetch (offline, no remote) falls through to local refs.
+    local branch="yolo/$session" base="" remote def out b
+    remote=$(git -C "$top" config branch.main.remote 2>/dev/null) \
+        || remote=$(git -C "$top" config branch.master.remote 2>/dev/null) \
+        || remote=origin
+    def=$(git -C "$top" symbolic-ref --quiet --short "refs/remotes/$remote/HEAD" 2>/dev/null) || def=
+    def="${def#"$remote"/}"
+    for b in $def main master; do
+        if git -C "$top" fetch --quiet "$remote" "$b" 2>/dev/null \
+            && git -C "$top" show-ref --verify --quiet "refs/remotes/$remote/$b"; then
+            base="$remote/$b"; break
+        fi
+        if git -C "$top" show-ref --verify --quiet "refs/heads/$b"; then
+            base="$b"; break
+        fi
+    done
+    [ -n "$base" ] || base=$(git -C "$top" rev-parse --abbrev-ref HEAD 2>/dev/null) || base=HEAD
+
+    if git -C "$top" show-ref --verify --quiet "refs/heads/$branch"; then
+        out=$(git -C "$top" worktree add "$wt" "$branch" 2>&1) || true
+    else
+        out=$(git -C "$top" worktree add -b "$branch" "$wt" "$base" 2>&1) || true
+    fi
+    if [ ! -d "$wt" ]; then
+        printf 'yoloagy: worktree setup failed (%s); launching in %s\n' "$out" "$PWD" >&2
+        printf '%s' "$PWD"; return 0
+    fi
+    printf 'yoloagy: session %s isolated in %s (branch %s, from %s)\n' \
+        "$session" "$wt" "$branch" "$base" >&2
+    printf '%s' "$wt"
+}
+
+# ---------------------------------------------------------------------------
+# Command line
+# ---------------------------------------------------------------------------
+
+usage() {
+    cat <<'EOF'
+yoloagy - start (or reattach to) a tmux session running agy.
+
+An SSH dropout leaves the session running; SSH back in and re-run.
+
+Usage:
+  yoloagy                       session "agy"
+  yoloagy <alias>               session "<prefix>-<alias>", where <prefix>
+                                comes from the current directory
+  yoloagy --restart [<alias>]   kill the session (if any) and start a fresh one
+  yoloagy --detach  [<alias>]   create the session if needed but do not
+                                attach; print `session=<name>` and `dir=<path>`
+  yoloagy --here    [<alias>]   launch in the current directory instead of
+  yoloagy --no-worktree [<alias>]  an isolated per-session worktree
+  yoloagy -l, --list            list live yoloagy sessions
+  yoloagy --prefix              print the session-name prefix for this directory
+  yoloagy -h, --help            show this help
+
+Flags may be combined, e.g. `yoloagy --restart --detach 2`.
+
+Worktree isolation: a NAMED session started from a git repository's primary
+checkout runs in its own linked worktree, <repo>/.worktrees/<session> on
+branch yolo/<session>, so parallel sessions never share a working tree, index
+or HEAD. The bare `yoloagy`, a directory already inside a linked worktree, and
+non-git directories launch in place. Linux and macOS only.
+
+Environment:
+  YOLOAGY_AGY                   agy command to run (default: `agy` on PATH, else ~/.local/bin/agy)
+
+Example: from ~/src/webapp/scripts, `yoloagy 2` opens session "webapp-2".
+
+Detach without killing:  <prefix key> then d (Ctrl-b unless rebound)
+Kill it:                 exit agy, or `tmux -L <session> kill-server`
+EOF
+}
+
+_yolo_bind_mux
+
+restart=0
+detach=0
+want_worktree=1
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)  usage; exit 0 ;;
+        -l|--list)
+            _yolo_require_mux || exit 1
+            sessions=$(_yolo_list_sessions)
+            if [ -n "$sessions" ]; then
+                printf '%s\n' "$sessions"
+            else
+                echo "no yoloagy sessions"
+            fi
+            exit 0
+            ;;
+        --prefix)   _yolo_session_prefix; echo; exit 0 ;;
+        --restart)  restart=1; shift ;;
+        --detach)   detach=1; shift ;;
+        --here|--no-worktree) want_worktree=0; shift ;;
+        --)         shift; break ;;
+        -*)         echo "yoloagy: unknown option: $1 (see --help)" >&2; exit 2 ;;
+        *)          break ;;
+    esac
+done
+
+alias_arg="${1:-}"
+if [ $# -gt 1 ]; then
+    echo "yoloagy: expected at most one alias, got: $*" >&2
+    exit 2
+fi
+# The alias becomes part of a tmux session name, a socket name, a directory and
+# a branch name, so keep it to characters all four accept.
+case "$alias_arg" in
+    *[!A-Za-z0-9_-]*)
+        echo "yoloagy: alias may contain only letters, digits, '-' and '_': $alias_arg" >&2
+        exit 2 ;;
+esac
+
+_yolo_require_mux || exit 1
+
+# The pane command. No --dangerously-skip-permissions: that flag approves every
+# prompt, including the ones a command gate escalates to you. Leave approval to
+# agy's own toolPermission setting and whatever hook gates its commands (see
+# README, "Gating agy's commands").
+#
+# Resolved to a path up front so a missing agy fails here with a clear message
+# rather than as a pane that exits immediately. On Windows the pane runs under
+# pwsh, which cannot exec a POSIX path, so the bare name is passed through.
+cmd="${YOLOAGY_AGY:-agy}"
+if ! _yolo_is_windows; then
+    # agy's installer puts it in ~/.local/bin, which a non-login shell's PATH
+    # may lack.
+    if resolved=$(command -v -- "$cmd"); then
+        cmd="$resolved"
+    elif [ -z "${YOLOAGY_AGY:-}" ] && [ -x "$HOME/.local/bin/agy" ]; then
+        cmd="$HOME/.local/bin/agy"
+    else
+        echo "yoloagy: '$cmd' not found on PATH or in ~/.local/bin (set YOLOAGY_AGY to override)" >&2
+        exit 1
+    fi
+fi
+
+if [ -z "$alias_arg" ]; then
+    session="agy"
+else
+    session="$(_yolo_session_prefix)-${alias_arg}"
+fi
+
+# Each session is its own server, addressed by a -L socket named after it.
+# psmux scopes the "current session" per server rather than per client, so a
+# second client attaching to a shared server gets that server's session and
+# ignores -t. One session per server means each server only ever has its own
+# client, and windows on different sessions stay independent.
+if [ "$restart" -eq 1 ] && ! _yolo_session_absent "$session" \
+    && tmux -L "$session" has-session -t "$session" 2>/dev/null; then
+    echo "killing existing session: $session"
+    tmux -L "$session" kill-server
+fi
+
+launch_dir="$PWD"
+if [ -n "$alias_arg" ]; then
+    launch_dir=$(_yolo_resolve_launch_dir "$session" "$want_worktree")
+fi
+
+created=0
+if _yolo_session_absent "$session" \
+   || ! tmux -L "$session" has-session -t "$session" 2>/dev/null; then
+    # psmux can exit nonzero from new-session even when the session was created,
+    # so has-session, not new-session's exit code, decides success.
+    ns_err=$(tmux -L "$session" new-session -d -s "$session" \
+        -c "$launch_dir" "$cmd" 2>&1) || true
+    if ! tmux -L "$session" has-session -t "$session" 2>/dev/null; then
+        # A psmux server that died on logout leaves its state files behind, and
+        # new-session then fails as a duplicate. Evict the husk and retry once.
+        tmux -L "$session" kill-server 2>/dev/null || true
+        ns_err=$(tmux -L "$session" new-session -d -s "$session" \
+            -c "$launch_dir" "$cmd" 2>&1) || true
+    fi
+    # new-session's output is empty even on success, so fall back to
+    # has-session's own error for the diagnostic.
+    if ! hs_err=$(tmux -L "$session" has-session -t "$session" 2>&1); then
+        echo "yoloagy: failed to create session '$session': ${ns_err:-${hs_err:-unknown error}}" >&2
+        exit 1
+    fi
+    created=1
+fi
+
+# psmux defaults status-left-length to 10, which cuts "[<session>] " short.
+# Widen it to fit; runs on reattach too.
+tmux -L "$session" set-option -g status-left-length "$(( ${#session} + 6 ))" >/dev/null 2>&1 || true
+_yolo_tune_mux "$session"
+
+if [ "$detach" -eq 1 ]; then
+    if [ "$created" -eq 1 ]; then
+        echo "created detached session: $session"
+    else
+        echo "session already running: $session"
+    fi
+    # `dir=` is the directory passed to -c, which differs from the caller's when
+    # worktree isolation redirected the session.
+    echo "session=$session"
+    echo "dir=$launch_dir"
+    exit 0
+fi
+
+# Inside another tmux client, a plain attach nests a second client in the
+# current pane. `detach-client -E` makes the attached client detach and exec the
+# attach in its place, so the terminal shows the target session directly; the
+# session it leaves keeps running. It fails without side effects on tmux < 3.2
+# or with no attached client, and the nested attach below covers both. psmux
+# accepts -E silently and does nothing, so it is never tried on Windows.
+if ! _yolo_is_windows && [ -n "${TMUX:-}" ] \
+   && tmux detach-client -E "${_YOLO_MUX_BIN:-tmux} -L $session attach -t $session" 2>/dev/null; then
+    exit 0
+fi
+# psmux's nesting guard keys off PSMUX_SESSION rather than TMUX, so clear both.
+unset TMUX PSMUX_SESSION PSMUX_TARGET_SESSION
+exec "${_YOLO_MUX_BIN:-tmux}" -L "$session" attach -t "$session"
