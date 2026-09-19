@@ -10,7 +10,7 @@
 
 _yoloagy_complete() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
-    local flags="--restart --detach --here --no-worktree -l --list --prefix -h --help"
+    local flags="--restart --detach --here --no-worktree --worktree -l --list --prefix -h --help"
     local prefix s words=""
 
     if [[ "$cur" == -* ]]; then

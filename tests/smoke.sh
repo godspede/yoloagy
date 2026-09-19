@@ -150,6 +150,20 @@ case "$out" in *"dir=$repo"*) ;; *) fail "--here: $out" ;; esac
 [ ! -e "$repo/.worktrees/proj-inplace" ] || fail "--here created a worktree"
 ok "--here launches in place"
 
+# YOLOAGY_WORKTREE=0 turns worktrees off for every launch; --worktree turns
+# one back on.
+started+=("proj-envoff")
+out=$(YOLOAGY_WORKTREE=0 "$yoloagy" --detach envoff 2>/dev/null)
+case "$out" in *"dir=$repo"*) ;; *) fail "YOLOAGY_WORKTREE=0: $out" ;; esac
+[ ! -e "$repo/.worktrees/proj-envoff" ] || fail "YOLOAGY_WORKTREE=0 created a worktree"
+ok "YOLOAGY_WORKTREE=0 launches named sessions in place"
+
+started+=("proj-envforce")
+out=$(YOLOAGY_WORKTREE=0 "$yoloagy" --worktree --detach envforce 2>/dev/null)
+case "$out" in *"dir=$repo/.worktrees/proj-envforce"*) ;; *) fail "--worktree over YOLOAGY_WORKTREE=0: $out" ;; esac
+[ -d "$repo/.worktrees/proj-envforce" ] || fail "--worktree made no worktree"
+ok "--worktree overrides YOLOAGY_WORKTREE=0"
+
 # The bare session launches in place, as "agy".
 started+=("agy")
 out=$("$yoloagy" --detach 2>/dev/null)

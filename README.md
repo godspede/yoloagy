@@ -44,6 +44,7 @@ yoloagy --restart [<alias>]   kill the session (if any) and start a fresh one
 yoloagy --detach  [<alias>]   create the session but do not attach
 yoloagy --here    [<alias>]   launch in the current directory, no worktree
 yoloagy --no-worktree [<alias>]   same as --here
+yoloagy --worktree [<alias>]  use a worktree even when YOLOAGY_WORKTREE=0
 yoloagy -l, --list            list live yoloagy sessions
 yoloagy --prefix              print the session-name prefix for this directory
 yoloagy -h, --help            show help
@@ -90,6 +91,8 @@ checkout, yoloagy creates a linked worktree for it:
 
 It launches in place instead when:
 
+- `YOLOAGY_WORKTREE=0` is set, for example in `~/.bashrc`, which turns worktrees
+  off for every launch (`--worktree` turns one back on);
 - you run bare `yoloagy` with no alias;
 - the current directory is already inside a linked worktree;
 - the current directory is not in a git repository;

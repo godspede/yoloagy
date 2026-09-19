@@ -275,6 +275,7 @@ Usage:
                                 attach; print `session=<name>` and `dir=<path>`
   yoloagy --here    [<alias>]   launch in the current directory instead of
   yoloagy --no-worktree [<alias>]  an isolated per-session worktree
+  yoloagy --worktree [<alias>]  use a worktree even if YOLOAGY_WORKTREE=0
   yoloagy -l, --list            list live yoloagy sessions
   yoloagy --prefix              print the session-name prefix for this directory
   yoloagy -h, --help            show this help
@@ -289,6 +290,8 @@ non-git directories launch in place. Linux and macOS only.
 
 Environment:
   YOLOAGY_AGY                   agy command to run (default: `agy` on PATH, else ~/.local/bin/agy)
+  YOLOAGY_WORKTREE              0 to launch every session in place, as if
+                                --here were always given (default: 1)
 
 Example: from ~/src/webapp/scripts, `yoloagy 2` opens session "webapp-2".
 
@@ -301,7 +304,10 @@ _yolo_bind_mux
 
 restart=0
 detach=0
-want_worktree=1
+case "${YOLOAGY_WORKTREE:-1}" in
+    0|no|false|off) want_worktree=0 ;;
+    *)              want_worktree=1 ;;
+esac
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help)  usage; exit 0 ;;
@@ -319,6 +325,7 @@ while [ $# -gt 0 ]; do
         --restart)  restart=1; shift ;;
         --detach)   detach=1; shift ;;
         --here|--no-worktree) want_worktree=0; shift ;;
+        --worktree) want_worktree=1; shift ;;
         --)         shift; break ;;
         -*)         echo "yoloagy: unknown option: $1 (see --help)" >&2; exit 2 ;;
         *)          break ;;
